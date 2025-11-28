@@ -315,6 +315,8 @@ def train_level_models(df: pd.DataFrame):
     return pipelines, accuracies, best_model_name, label_enc
 
 
+
+
 # =========================
 # 3. REGRESSION – RATING PREDICTION
 # =========================
@@ -466,3 +468,4 @@ def recommend_exercises(
 
 
     return temp.head(top_n)
+
