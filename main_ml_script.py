@@ -56,7 +56,6 @@ def load_data(path: str = "megaGymDataset.csv") -> pd.DataFrame:
 # =========================
 # 2. CLASSIFICATION – MULTI-MODEL COMPARISON
 # =========================
-
 def train_level_models(df: pd.DataFrame):
     """
     Train multiple classifiers to predict Level from Type, BodyPart, Equipment.
@@ -108,7 +107,7 @@ def train_level_models(df: pd.DataFrame):
         random_state=42
     )
 
-    # 3. ANN / MLP
+    # 3. ANN / MLP (still used for comparison, but NO curves now)
     models["ANN_MLP"] = MLPClassifier(
         hidden_layer_sizes=(64, 32),
         activation="relu",
@@ -120,10 +119,10 @@ def train_level_models(df: pd.DataFrame):
         random_state=42
     )
 
-    # 4. XGBoost (optional)
+    # 4. XGBoost (optional, main model + curves)
     if XGBClassifier is not None:
         models["XGBoost"] = XGBClassifier(
-            n_estimators=300,
+            n_estimators=300,               # main model for comparison
             learning_rate=0.1,
             max_depth=6,
             subsample=0.8,
@@ -204,52 +203,114 @@ def train_level_models(df: pd.DataFrame):
     plt.savefig("classification_accuracy_comparison.png")
     plt.close()
 
-    # Best model
-    best_model_name = max(accuracies, key=accuracies.get)
+    # ----------------------------------------
+    # Best model: FORCE XGBoost if available
+    # ----------------------------------------
+    if "XGBoost" in accuracies:
+        best_model_name = "XGBoost"
+    else:
+        best_model_name = max(accuracies, key=accuracies.get)
 
-    # Confusion Matrix for Best Model
+    # Confusion Matrix Heatmap for Best Model
     best_y_test = y_test_dict[best_model_name]
     best_y_pred = y_pred_dict[best_model_name]
 
     cm = confusion_matrix(best_y_test, best_y_pred)
-    disp = ConfusionMatrixDisplay(confusion_matrix=cm, display_labels=label_enc.classes_)
 
-    plt.figure()
-    disp.plot(cmap="Blues", values_format="d")
-    plt.title(f"Confusion Matrix - {best_model_name}")
+    plt.figure(figsize=(6, 5))
+    sns.heatmap(
+        cm,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        xticklabels=label_enc.classes_,
+        yticklabels=label_enc.classes_
+    )
+    plt.xlabel("Predicted label")
+    plt.ylabel("True label")
+    plt.title(f"Confusion Matrix Heatmap - {best_model_name}")
     plt.tight_layout()
-    plt.savefig("confusion_matrix_best_model.png")
+
+    if best_model_name == "XGBoost":
+        plt.savefig("confusion_matrix_xgboost_heatmap.png")
+    else:
+        plt.savefig(f"confusion_matrix_{best_model_name}_heatmap.png")
+
     plt.close()
 
-    # Training Curves for ANN / MLP
-    if "ANN_MLP" in pipelines:
-        ann_pipeline = pipelines["ANN_MLP"]
-        ann_model = ann_pipeline.named_steps["model"]
+    # =====================================================
+    # NEW: XGBoost Training Curves (up to 100 epochs)
+    # =====================================================
+    if XGBClassifier is not None:
+        print("\nTraining separate XGBoost (100 trees) for loss/accuracy curves...")
 
-        if hasattr(ann_model, "loss_curve_"):
-            plt.figure()
-            epochs = range(1, len(ann_model.loss_curve_) + 1)
-            plt.plot(epochs, ann_model.loss_curve_, marker="o")
-            plt.xlabel("Epoch")
-            plt.ylabel("Training Loss")
-            plt.title("ANN Training Loss vs Epochs")
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig("ann_training_loss_curve.png")
-            plt.close()
+        # Separate preprocessor ONLY for this curve model
+        xgb_curve_preprocessor = ColumnTransformer(
+            transformers=[
+                ("cat", OneHotEncoder(handle_unknown="ignore"), feature_cols)
+            ]
+        )
 
-        if hasattr(ann_model, "validation_scores_"):
-            plt.figure()
-            val_epochs = range(1, len(ann_model.validation_scores_) + 1)
-            plt.plot(val_epochs, ann_model.validation_scores_, marker="o")
-            plt.xlabel("Epoch")
-            plt.ylabel("Validation Accuracy")
-            plt.title("ANN Validation Accuracy vs Epochs")
-            plt.grid(True)
-            plt.tight_layout()
-            plt.savefig("ann_validation_accuracy_curve.png")
-            plt.close()
+        # One-hot encode train / validation
+        X_train_enc = xgb_curve_preprocessor.fit_transform(X_train)
+        X_val_enc = xgb_curve_preprocessor.transform(X_test)
 
+        # XGBoost model for curves (100 estimators = 100 epochs)
+        xgb_curve = XGBClassifier(
+            n_estimators=100,             # <= exactly 100 boosting rounds
+            learning_rate=0.1,
+            max_depth=6,
+            subsample=0.8,
+            colsample_bytree=0.8,
+            objective="multi:softprob",
+            random_state=42,
+            eval_metric=["mlogloss", "merror"],  # loss + classification error
+            use_label_encoder=False
+        )
+
+        xgb_curve.fit(
+            X_train_enc,
+            y_train,
+            eval_set=[(X_train_enc, y_train), (X_val_enc, y_test)],
+            verbose=False
+        )
+
+        results = xgb_curve.evals_result()
+
+        # Training loss (mlogloss)
+        train_loss = results["validation_0"]["mlogloss"]
+        # Validation classification error -> accuracy
+        val_error = results["validation_1"]["merror"]
+        val_accuracy = [1.0 - e for e in val_error]
+
+        epochs = range(1, len(train_loss) + 1)  # should be 1..100
+
+    # --- Plot 1: Training Loss vs Epoch (XGBoost) ---
+        plt.figure()
+        plt.plot(epochs, train_loss, marker="o")
+        plt.xlabel("Epoch (Boosting Round)")
+        plt.ylabel("Training Loss (mlogloss)")
+        plt.title("XGBoost Training Loss vs Epoch (100 trees)")
+        plt.xticks(np.arange(0, 101, 10))   # spacing 10 units
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("xgb_training_loss_curve.png")
+        plt.close()
+
+        # --- Plot 2: Validation Accuracy vs Epoch (XGBoost) ---
+        plt.figure()
+        plt.plot(epochs, val_accuracy, marker="o")
+        plt.xlabel("Epoch (Boosting Round)")
+        plt.ylabel("Validation Accuracy")
+        plt.title("XGBoost Validation Accuracy vs Epoch (100 trees)")
+        plt.xticks(np.arange(0, 101, 10))   # spacing 10 units
+        plt.grid(True)
+        plt.tight_layout()
+        plt.savefig("xgb_validation_accuracy_curve.png")
+        plt.close()
+
+        print("Saved: xgb_training_loss_curve.png, xgb_validation_accuracy_curve.png")
+       
     # *** IMPORTANT: match UI expectations: return ONLY 4 things ***
     return pipelines, accuracies, best_model_name, label_enc
 
@@ -402,5 +463,6 @@ def recommend_exercises(
         cols_to_show.append("PredRating")
 
     print(temp[cols_to_show].head(top_n).to_string(index=False))
+
 
     return temp.head(top_n)
